@@ -1,4 +1,4 @@
-# SAP GUI Logon via Raycast
+# SAP GUI Connector
 
 Quickly connect to SAP systems with your saved credentials.
 

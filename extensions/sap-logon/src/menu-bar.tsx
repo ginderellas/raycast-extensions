@@ -27,11 +27,19 @@ export default function Command() {
   }
 
   async function openMainView() {
-    await launchCommand({ name: "index", type: LaunchType.UserInitiated });
+    try {
+      await launchCommand({ name: "index", type: LaunchType.UserInitiated });
+    } catch (error) {
+      await showHUD(`❌ Failed to open main view: ${error}`);
+    }
   }
 
   async function openAddSystem() {
-    await launchCommand({ name: "add-system", type: LaunchType.UserInitiated });
+    try {
+      await launchCommand({ name: "add-system", type: LaunchType.UserInitiated });
+    } catch (error) {
+      await showHUD(`❌ Failed to open add system view: ${error}`);
+    }
   }
 
   return (

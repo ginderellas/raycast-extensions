@@ -1,33 +1,71 @@
-import { LocalStorage } from "@raycast/api";
+import { LocalStorage, environment } from "@raycast/api";
 import { SAPSystem } from "./types";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
 
 const SYSTEMS_KEY = "sap-systems";
-const ENCRYPTION_KEY = "sap-connector-encryption-key-v1";
+const ENCRYPTION_KEY_STORAGE = "sap-encryption-key";
 
-// Simple encryption for password storage
-function getEncryptionKey(): Buffer {
-  // Create a consistent 32-byte key from the encryption key string
-  return crypto.createHash("sha256").update(ENCRYPTION_KEY).digest();
+let cachedEncryptionKey: Buffer | null = null;
+let keyInitPromise: Promise<Buffer> | null = null;
+
+async function getOrCreateEncryptionKey(): Promise<Buffer> {
+  if (cachedEncryptionKey) {
+    return cachedEncryptionKey;
+  }
+
+  // Prevent race condition by reusing the same promise for concurrent calls
+  if (keyInitPromise) {
+    return keyInitPromise;
+  }
+
+  keyInitPromise = (async () => {
+    const storedKey = await LocalStorage.getItem<string>(ENCRYPTION_KEY_STORAGE);
+
+    if (storedKey) {
+      cachedEncryptionKey = Buffer.from(storedKey, "hex");
+      return cachedEncryptionKey;
+    }
+
+    // Generate a unique 32-byte key for this installation
+    const newKey = crypto.randomBytes(32);
+    await LocalStorage.setItem(ENCRYPTION_KEY_STORAGE, newKey.toString("hex"));
+    cachedEncryptionKey = newKey;
+    return newKey;
+  })();
+
+  try {
+    return await keyInitPromise;
+  } finally {
+    keyInitPromise = null;
+  }
 }
 
-export function encryptPassword(password: string): string {
+export async function encryptPassword(password: string): Promise<string> {
   const iv = crypto.randomBytes(16);
-  const key = getEncryptionKey();
+  const key = await getOrCreateEncryptionKey();
   const cipher = crypto.createCipheriv("aes-256-cbc", key as crypto.CipherKey, iv as crypto.BinaryLike);
   let encrypted = cipher.update(password, "utf8", "hex");
   encrypted += cipher.final("hex");
   return iv.toString("hex") + ":" + encrypted;
 }
 
-export function decryptPassword(encryptedPassword: string): string {
+export async function decryptPassword(encryptedPassword: string): Promise<string> {
   try {
-    const [ivHex, encrypted] = encryptedPassword.split(":");
+    if (!encryptedPassword || !encryptedPassword.includes(":")) {
+      return "";
+    }
+    const parts = encryptedPassword.split(":");
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      return "";
+    }
+    const [ivHex, encrypted] = parts;
+    if (!/^[0-9a-fA-F]{32}$/.test(ivHex)) {
+      return "";
+    }
     const iv = Buffer.from(ivHex, "hex");
-    const key = getEncryptionKey();
+    const key = await getOrCreateEncryptionKey();
     const decipher = crypto.createDecipheriv("aes-256-cbc", key as crypto.CipherKey, iv as crypto.BinaryLike);
     let decrypted = decipher.update(encrypted, "hex", "utf8");
     decrypted += decipher.final("utf8");
@@ -37,11 +75,29 @@ export function decryptPassword(encryptedPassword: string): string {
   }
 }
 
+function isValidSAPSystem(obj: unknown): obj is SAPSystem {
+  if (typeof obj !== "object" || obj === null) return false;
+  const system = obj as Record<string, unknown>;
+  return (
+    typeof system.id === "string" &&
+    typeof system.systemId === "string" &&
+    typeof system.applicationServer === "string" &&
+    typeof system.instanceNumber === "string" &&
+    typeof system.client === "string" &&
+    typeof system.username === "string" &&
+    typeof system.language === "string" &&
+    typeof system.createdAt === "string" &&
+    typeof system.updatedAt === "string"
+  );
+}
+
 export async function getSAPSystems(): Promise<SAPSystem[]> {
   const systemsJson = await LocalStorage.getItem<string>(SYSTEMS_KEY);
   if (!systemsJson) return [];
   try {
-    return JSON.parse(systemsJson);
+    const parsed = JSON.parse(systemsJson);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isValidSAPSystem);
   } catch {
     return [];
   }
@@ -54,11 +110,11 @@ export async function saveSAPSystems(systems: SAPSystem[]): Promise<void> {
 export async function getPassword(systemId: string): Promise<string> {
   const encryptedPassword = await LocalStorage.getItem<string>(`password-${systemId}`);
   if (!encryptedPassword) return "";
-  return decryptPassword(encryptedPassword);
+  return await decryptPassword(encryptedPassword);
 }
 
 export async function savePassword(systemId: string, password: string): Promise<void> {
-  const encrypted = encryptPassword(password);
+  const encrypted = await encryptPassword(password);
   await LocalStorage.setItem(`password-${systemId}`, encrypted);
 }
 
@@ -117,26 +173,67 @@ export async function deleteSAPSystem(id: string): Promise<void> {
   await deletePassword(id);
 }
 
+// Sanitize filename to prevent path traversal attacks
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+// Encode value for SAP connection string (avoid breaking on special chars)
+function encodeSAPValue(value: string): string {
+  return value.replace(/&/g, "%26").replace(/=/g, "%3D");
+}
+
 export async function createAndOpenSAPCFile(system: SAPSystem): Promise<string> {
   const password = await getPassword(system.id);
 
-  // Build the connection string
+  // Build the connection string with encoded values
   // Format: conn=/H/{application server}/S/32{instance number}&user={username}&lang={language}&client={client}&pass={password}
-  const connectionString = `conn=/H/${system.applicationServer}/S/32${system.instanceNumber}&user=${system.username}&lang=${system.language}&clnt=${system.client}&pass=${password}`;
+  const connectionString = `conn=/H/${encodeSAPValue(system.applicationServer)}/S/32${encodeSAPValue(system.instanceNumber)}&user=${encodeSAPValue(system.username)}&lang=${encodeSAPValue(system.language)}&clnt=${encodeSAPValue(system.client)}&pass=${encodeSAPValue(password)}`;
 
-  // Create temp directory if it doesn't exist
-  const tempDir = path.join(os.tmpdir(), "sap-connector");
+  // Use Raycast's support path for temp files (more appropriate than os.tmpdir)
+  const tempDir = path.join(environment.supportPath, "sapc-files");
   if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
   }
 
-  // Create the .sapc file
-  const fileName = `${system.systemId}_${system.client}.sapc`;
+  // Sanitize filename to prevent path injection
+  const sanitizedSystemId = sanitizeFilename(system.systemId);
+  const sanitizedClient = sanitizeFilename(system.client);
+  const fileName = `${sanitizedSystemId}_${sanitizedClient}.sapc`;
   const filePath = path.join(tempDir, fileName);
 
-  fs.writeFileSync(filePath, connectionString, "utf8");
+  // Write file with restrictive permissions (owner read/write only)
+  fs.writeFileSync(filePath, connectionString, { encoding: "utf8", mode: 0o600 });
+
+  // Schedule cleanup after 5 seconds to remove sensitive data from disk
+  setTimeout(() => {
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }, 5000);
 
   return filePath;
+}
+
+// Clean up SAPC files to remove sensitive data from disk
+export function cleanupSAPCFiles(): void {
+  try {
+    const tempDir = path.join(environment.supportPath, "sapc-files");
+    if (fs.existsSync(tempDir)) {
+      const files = fs.readdirSync(tempDir);
+      for (const file of files) {
+        if (file.endsWith(".sapc")) {
+          fs.unlinkSync(path.join(tempDir, file));
+        }
+      }
+    }
+  } catch {
+    // Ignore cleanup errors
+  }
 }
 
 export function validateInstanceNumber(value: string): string | undefined {

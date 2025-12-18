@@ -22,7 +22,7 @@
     },
     {
       "name": "connect",
-      "title": "Connect to SAP Sytem",
+      "title": "Connect to SAP System",
       "description": "Quick connect to a specific SAP system",
       "mode": "no-view",
       "arguments": [
